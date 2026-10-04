@@ -13,25 +13,12 @@
 
 [CmdletBinding()]
 param(
-    # Where to install the mosaico.exe binary.
     [string]$InstallDir = "$env:LOCALAPPDATA\mosaico",
-
-    # Version to install. Defaults to the latest GitHub release.
-    [string]$Version = "latest",
-
-    # Skip generating default config files.
+    [string]$Version    = "latest",
     [switch]$NoConfig,
-
-    # Skip enabling autostart.
     [switch]$NoAutostart,
-
-    # Skip adding the install directory to the user PATH.
     [switch]$NoPath,
-
-    # Force reinstall even if the same version is already present.
     [switch]$Force,
-
-    # Uninstall Mosaico instead of installing.
     [switch]$Uninstall
 )
 
@@ -53,30 +40,83 @@ function Write-Info {
     Write-Host "  ==> " -ForegroundColor Green -NoNewline
     Write-Host $Message
 }
-
 function Write-Warn {
     param([string]$Message)
     Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
     Write-Host $Message
 }
-
 function Write-Err {
     param([string]$Message)
     Write-Host "  [x] " -ForegroundColor Red -NoNewline
     Write-Host $Message
 }
-
 function Write-Step {
     param([string]$Message)
     Write-Host ""
     Write-Host "-- $Message " -ForegroundColor Cyan -NoNewline
     Write-Host ("-" * [Math]::Max(0, 58 - $Message.Length)) -ForegroundColor DarkGray
 }
-
 function Fail {
     param([string]$Message)
     Write-Err $Message
     exit 1
+}
+
+# Normalize a version string: trim, strip leading 'v'/'V'.
+function Get-NormalizedVersion {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    return ($Value.Trim() -replace '^[vV]', '')
+}
+
+# Extract a semver-ish token from arbitrary CLI output.
+function Get-VersionFromOutput {
+    param([string]$Output)
+    if ([string]::IsNullOrWhiteSpace($Output)) { return $null }
+    if ($Output -match '(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z\.\-]+)?)') {
+        return $Matches[1]
+    }
+    return ($Output.Trim() -replace '^mosaico\s+', '')
+}
+
+# Safely read `mosaico --version` without tripping on stderr / ErrorActionPreference.
+function Get-InstalledVersion {
+    param([string]$ExePath)
+    if (-not $ExePath -or -not (Test-Path -LiteralPath $ExePath)) { return $null }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $ExePath --version 2>&1 | Out-String
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return Get-VersionFromOutput $output
+}
+
+# Case-insensitive, trailing-slash-tolerant PATH entry check.
+function Test-PathEntry {
+    param([string]$PathString, [string]$Entry)
+    if ([string]::IsNullOrWhiteSpace($PathString) -or [string]::IsNullOrWhiteSpace($Entry)) {
+        return $false
+    }
+    $target = $Entry.TrimEnd('\')
+    foreach ($p in ($PathString -split ';')) {
+        if ($p -and $p.TrimEnd('\') -ieq $target) { return $true }
+    }
+    return $false
+}
+
+# Remove an entry from a PATH string, case-insensitive, tolerant of trailing slashes.
+function Remove-PathEntry {
+    param([string]$PathString, [string]$Entry)
+    if ([string]::IsNullOrWhiteSpace($PathString)) { return "" }
+    $target = $Entry.TrimEnd('\')
+    $kept = foreach ($p in ($PathString -split ';')) {
+        if ($p -and $p.TrimEnd('\') -ine $target) { $p }
+    }
+    return ($kept -join ';')
 }
 
 # ─── Uninstall Path ────────────────────────────────────────────────────
@@ -98,7 +138,7 @@ if ($Uninstall) {
 
     Write-Step "Disabling autostart"
     $exePath = Join-Path $InstallDir $ExeName
-    if (Test-Path $exePath) {
+    if (Test-Path -LiteralPath $exePath) {
         try {
             & $exePath autostart disable 2>$null | Out-Null
             Write-Info "Autostart disabled"
@@ -111,9 +151,8 @@ if ($Uninstall) {
 
     Write-Step "Removing from PATH"
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($userPath -like "*$InstallDir*") {
-        $newPath = ($userPath -split ';' |
-            Where-Object { $_ -and $_ -ne $InstallDir }) -join ';'
+    if (Test-PathEntry -PathString $userPath -Entry $InstallDir) {
+        $newPath = Remove-PathEntry -PathString $userPath -Entry $InstallDir
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
         Write-Info "Removed $InstallDir from user PATH"
     } else {
@@ -121,16 +160,16 @@ if ($Uninstall) {
     }
 
     Write-Step "Removing binary"
-    if (Test-Path $InstallDir) {
-        Remove-Item -Recurse -Force $InstallDir
+    if (Test-Path -LiteralPath $InstallDir) {
+        Remove-Item -Recurse -Force -LiteralPath $InstallDir
         Write-Info "Removed $InstallDir"
     } else {
         Write-Info "Install directory does not exist"
     }
 
     Write-Step "Removing config"
-    if (Test-Path $ConfigDir) {
-        Remove-Item -Recurse -Force $ConfigDir
+    if (Test-Path -LiteralPath $ConfigDir) {
+        Remove-Item -Recurse -Force -LiteralPath $ConfigDir
         Write-Info "Removed $ConfigDir"
     } else {
         Write-Info "Config directory does not exist"
@@ -181,94 +220,101 @@ if ($Version -eq "latest") {
         Fail "Could not determine latest version. Check https://github.com/$Repo/releases"
     }
 } else {
+    # Normalize to tag form (v-prefixed) so download URLs resolve.
+    if ($Version -notmatch '^[vV]') { $Version = "v$Version" }
     Write-Info "Pinned version: $Version"
 }
 
+$normalizedNew = Get-NormalizedVersion $Version
+
 # ─── Existing Installation ─────────────────────────────────────────────
-$exePath = Join-Path $InstallDir $ExeName
-$existingVersion = $null
+Write-Step "Checking existing installation"
 
-if (Test-Path $exePath) {
-    try {
-        $existingVersion = (& $exePath --version 2>$null) -replace '^mosaico\s+', ''
-        Write-Info "Existing installation: $existingVersion"
-    } catch {
-        Write-Warn "Existing binary found but could not read version"
-    }
+$exePath         = Join-Path $InstallDir $ExeName
+$existingVersion = Get-InstalledVersion -ExePath $exePath
+$skipInstall     = $false
 
-    if ($existingVersion -eq $Version -and -not $Force) {
-        Write-Info "Already up to date ($Version). Use -Force to reinstall."
-        exit 0
-    }
+if ($existingVersion) {
+    $normalizedExisting = Get-NormalizedVersion $existingVersion
+    Write-Info "Existing installation: $existingVersion"
 
-    if ($existingVersion) {
+    if ($normalizedExisting -eq $normalizedNew -and -not $Force) {
+        Write-Info "Binary already up to date ($Version) — skipping download."
+        $skipInstall = $true
+    } else {
         Write-Info "Upgrading $existingVersion -> $Version"
     }
+} elseif (Test-Path -LiteralPath $InstallDir) {
+    Write-Warn "Install directory exists but no binary found at $exePath"
 }
 
-# ─── Download ──────────────────────────────────────────────────────────
-Write-Step "Downloading"
+# ─── Download / Extract / Install ──────────────────────────────────────
+if (-not $skipInstall) {
+    Write-Step "Downloading"
 
-$url      = "https://github.com/$Repo/releases/download/$Version/$AssetName"
-$tempBase = (Get-Item $env:TEMP).FullName
-$tempDir  = Join-Path $tempBase "mosaico-install-$PID"
-$zipPath  = Join-Path $tempDir $AssetName
+    $url      = "https://github.com/$Repo/releases/download/$Version/$AssetName"
+    $tempBase = if ($env:TEMP) { (Get-Item -LiteralPath $env:TEMP).FullName } else { [IO.Path]::GetTempPath() }
+    $tempDir  = Join-Path $tempBase "mosaico-install-$PID"
+    $zipPath  = Join-Path $tempDir $AssetName
 
-New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
-try {
-    Write-Info "Downloading $AssetName..."
-    Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
-    $sizeMB = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
-    Write-Info "Downloaded $sizeMB MB"
-} catch {
-    Fail "Download failed: $_"
+    try {
+        Write-Info "Downloading $AssetName..."
+        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+        $sizeMB = [Math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
+        Write-Info "Downloaded $sizeMB MB"
+    } catch {
+        Fail "Download failed: $_"
+    }
+
+    Write-Step "Extracting"
+    try {
+        Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
+        Write-Info "Extracted to $tempDir"
+    } catch {
+        Fail "Extraction failed: $_"
+    }
+
+    $extractedExe = Get-ChildItem -Path $tempDir -Filter $ExeName -Recurse |
+        Select-Object -First 1
+    if (-not $extractedExe) {
+        Fail "Could not find $ExeName in the extracted archive."
+    }
+
+    Write-Step "Preparing installation"
+    $running = Get-Process -Name "mosaico" -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Info "Stopping running daemon..."
+        $running | Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+    }
+
+    Write-Step "Installing"
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Copy-Item -LiteralPath $extractedExe.FullName -Destination $exePath -Force
+    Unblock-File -LiteralPath $exePath
+    Write-Info "Installed to $exePath"
+} else {
+    # Ensure the existing binary is unblocked, in case it was fetched by a browser.
+    try { Unblock-File -LiteralPath $exePath -ErrorAction SilentlyContinue } catch { }
 }
-
-# ─── Extract ───────────────────────────────────────────────────────────
-Write-Step "Extracting"
-
-try {
-    Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
-    Write-Info "Extracted to $tempDir"
-} catch {
-    Fail "Extraction failed: $_"
-}
-
-$extractedExe = Get-ChildItem -Path $tempDir -Filter $ExeName -Recurse |
-    Select-Object -First 1
-if (-not $extractedExe) {
-    Fail "Could not find $ExeName in the extracted archive."
-}
-
-# ─── Stop Running Daemon ───────────────────────────────────────────────
-Write-Step "Preparing installation"
-
-$running = Get-Process -Name "mosaico" -ErrorAction SilentlyContinue
-if ($running) {
-    Write-Info "Stopping running daemon..."
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
-}
-
-# ─── Install ───────────────────────────────────────────────────────────
-Write-Step "Installing"
-
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Path $extractedExe.FullName -Destination $exePath -Force
-Unblock-File -Path $exePath
-Write-Info "Installed to $exePath"
 
 # ─── PATH ──────────────────────────────────────────────────────────────
 if (-not $NoPath) {
     Write-Step "Updating PATH"
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($userPath -notlike "*$InstallDir*") {
-        [Environment]::SetEnvironmentVariable(
-            "Path", "$userPath;$InstallDir", "User"
-        )
-        $env:Path = "$env:Path;$InstallDir"
+    if (-not (Test-PathEntry -PathString $userPath -Entry $InstallDir)) {
+        $newPath = if ([string]::IsNullOrEmpty($userPath)) {
+            $InstallDir
+        } else {
+            "$userPath;$InstallDir"
+        }
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        if (-not (Test-PathEntry -PathString $env:Path -Entry $InstallDir)) {
+            $env:Path = "$env:Path;$InstallDir"
+        }
         Write-Info "Added $InstallDir to user PATH"
     } else {
         Write-Info "Already on PATH"
@@ -278,19 +324,18 @@ if (-not $NoPath) {
 # ─── Verify ────────────────────────────────────────────────────────────
 Write-Step "Verifying"
 
-try {
-    $installedVersion = (& $exePath --version) -replace '^mosaico\s+', ''
-    Write-Info "Installed version: $installedVersion"
-} catch {
-    Fail "Verification failed — the binary did not run: $_"
+$installedVersion = Get-InstalledVersion -ExePath $exePath
+if (-not $installedVersion) {
+    Fail "Verification failed — the binary did not run at $exePath"
 }
+Write-Info "Installed version: $installedVersion"
 
 # ─── Config ────────────────────────────────────────────────────────────
 if (-not $NoConfig) {
     Write-Step "Generating config"
 
     $configFile = Join-Path $ConfigDir "config.toml"
-    if (Test-Path $configFile) {
+    if (Test-Path -LiteralPath $configFile) {
         Write-Info "Config already exists at $ConfigDir — leaving it untouched"
     } else {
         New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
@@ -313,9 +358,13 @@ if (-not $NoAutostart) {
 }
 
 # ─── Cleanup ───────────────────────────────────────────────────────────
-Write-Step "Cleaning up"
-Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
-Write-Info "Temporary files removed"
+if (-not $skipInstall) {
+    Write-Step "Cleaning up"
+    if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
+        Remove-Item -Recurse -Force -LiteralPath $tempDir -ErrorAction SilentlyContinue
+    }
+    Write-Info "Temporary files removed"
+}
 
 # ─── Done ──────────────────────────────────────────────────────────────
 Write-Host ""
@@ -336,5 +385,5 @@ Write-Host ""
 if (-not $NoAutostart) {
     Write-Host "  Autostart enabled. Disable with: mosaico autostart disable" -ForegroundColor DarkGray
 }
-Write-Host "  Uninstall with: .\install.ps1 -Uninstall" -ForegroundColor DarkGray
+Write-Host "  Uninstall with: install.ps1 -Uninstall" -ForegroundColor DarkGray
 Write-Host ""
