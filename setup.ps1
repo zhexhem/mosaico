@@ -11,6 +11,8 @@
 #   .\setup.ps1 -SkipConfig              # Skip config generation
 #   .\setup.ps1 -Minimal                 # Binary only, no config, no profile, no autostart
 #   .\setup.ps1 -DryRun                  # Show what would happen without doing it
+#   .\setup.ps1 -Version v0.3.0          # Pin a specific release tag
+#   .\setup.ps1 -Force                   # Overwrite existing config + reinstall binary
 # ──────────────────────────────────────────────────────────────────────
 
 [CmdletBinding()]
@@ -23,6 +25,9 @@ param(
 
     # Where to clone the repo when building from source.
     [string]$SourceDir = "$env:USERPROFILE\.mosaico-src",
+
+    # Pin to a specific release tag (default: latest).
+    [string]$Version,
 
     # Skip the install step (assumes mosaico is already installed).
     [switch]$SkipInstall,
@@ -47,6 +52,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 # ─── Apply Minimal Preset ──────────────────────────────────────────────
 if ($Minimal) {
@@ -56,46 +62,31 @@ if ($Minimal) {
 }
 
 # ─── Constants ─────────────────────────────────────────────────────────
-$Repo       = "zhexhem/mosaico"
-$ExeName    = "mosaico.exe"
-$ConfigDir  = if ($env:XDG_CONFIG_HOME) {
+$Repo          = "zhexhem/mosaico"
+$ExeName       = "mosaico.exe"
+$ConfigDir     = if ($env:XDG_CONFIG_HOME) {
     Join-Path $env:XDG_CONFIG_HOME "mosaico"
 } else {
     Join-Path $env:USERPROFILE ".config\mosaico"
 }
 $ProfileScript = Join-Path $ConfigDir "profile.ps1"
+$IsPS7Plus     = $PSVersionTable.PSVersion.Major -ge 7
+$BannerWidth   = 56
 
 # ─── Helpers ───────────────────────────────────────────────────────────
 function Write-Step {
     param([string]$Message)
+    $prefix = "── $Message "
+    $fill   = [Math]::Max(0, $BannerWidth - $prefix.Length)
     Write-Host ""
-    Write-Host "── $Message " -ForegroundColor Cyan -NoNewline
-    Write-Host ("─" * [Math]::Max(0, 56 - $Message.Length)) -ForegroundColor DarkGray
+    Write-Host $prefix -ForegroundColor Cyan -NoNewline
+    Write-Host ("─" * $fill) -ForegroundColor DarkGray
 }
 
-function Write-Info {
-    param([string]$Message)
-    Write-Host "   ✓ " -ForegroundColor Green -NoNewline
-    Write-Host $Message
-}
-
-function Write-Warn {
-    param([string]$Message)
-    Write-Host "   ! " -ForegroundColor Yellow -NoNewline
-    Write-Host $Message
-}
-
-function Write-Err {
-    param([string]$Message)
-    Write-Host "   ✗ " -ForegroundColor Red -NoNewline
-    Write-Host $Message
-}
-
-function Write-Skip {
-    param([string]$Message)
-    Write-Host "   › " -ForegroundColor DarkGray -NoNewline
-    Write-Host $Message -ForegroundColor DarkGray
-}
+function Write-Info { param([string]$Message) Write-Host "   ✓ " -ForegroundColor Green   -NoNewline; Write-Host $Message }
+function Write-Warn { param([string]$Message) Write-Host "   ! " -ForegroundColor Yellow  -NoNewline; Write-Host $Message }
+function Write-Err  { param([string]$Message) Write-Host "   ✗ " -ForegroundColor Red     -NoNewline; Write-Host $Message }
+function Write-Skip { param([string]$Message) Write-Host "   › " -ForegroundColor DarkGray -NoNewline; Write-Host $Message -ForegroundColor DarkGray }
 
 function Invoke-Or-Dry {
     param(
@@ -117,16 +108,41 @@ function Fail {
     exit 1
 }
 
+function Test-DirOnPath {
+    param([string]$Dir)
+    $canonical = $Dir.TrimEnd('\')
+    $paths = @(
+        [Environment]::GetEnvironmentVariable("Path", "User")
+        [Environment]::GetEnvironmentVariable("Path", "Machine")
+        $env:Path
+    ) -join ';'
+    ($paths -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }) `
+        -contains $canonical
+}
+
+function Invoke-WebRequestCompat {
+    param([string]$Uri, [string]$OutFile)
+    $params = @{ Uri = $Uri; OutFile = $OutFile }
+    if (-not $IsPS7Plus) { $params.UseBasicParsing = $true }
+    Invoke-WebRequest @params
+}
+
 # ─── Banner ────────────────────────────────────────────────────────────
+$top    = "  ╔" + ("═" * $BannerWidth) + "╗"
+$blank  = "  ║" + (" " * $BannerWidth) + "║"
+$title  = "   Mosaico — Tiling Window Manager Setup"
+$url    = "   https://github.com/$Repo"
+$titleL = "  ║" + $title + (" " * ($BannerWidth - $title.Length)) + "║"
+$urlL   = "  ║" + $url   + (" " * ($BannerWidth - $url.Length))   + "║"
+$bottom = "  ╚" + ("═" * $BannerWidth) + "╝"
+
 Write-Host ""
-Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║                                                  ║" -ForegroundColor Cyan
-Write-Host "  ║   Mosaico — Tiling Window Manager Setup          ║" -ForegroundColor Cyan
-Write-Host "  ║   https://github.com/$Repo" -ForegroundColor Cyan -NoNewline
-Write-Host (" " * (34 - $Repo.Length)) -NoNewline
-Write-Host "║" -ForegroundColor Cyan
-Write-Host "  ║                                                  ║" -ForegroundColor Cyan
-Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host $top    -ForegroundColor Cyan
+Write-Host $blank  -ForegroundColor Cyan
+Write-Host $titleL -ForegroundColor Cyan
+Write-Host $urlL   -ForegroundColor Cyan
+Write-Host $blank  -ForegroundColor Cyan
+Write-Host $bottom -ForegroundColor Cyan
 
 if ($DryRun) {
     Write-Host ""
@@ -148,7 +164,9 @@ if ($arch -ne "AMD64") {
     Write-Info "Architecture AMD64"
 }
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if (-not $IsPS7Plus) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
 
 if ($FromSource) {
     $cargo = Get-Command cargo -ErrorAction SilentlyContinue
@@ -156,6 +174,11 @@ if ($FromSource) {
         Fail "Rust toolchain (cargo) required for -FromSource. Install from https://rustup.rs"
     }
     Write-Info "Rust toolchain: $(cargo --version)"
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) {
+        Fail "git is required for -FromSource."
+    }
 }
 
 # Check for conflicting tiling managers
@@ -176,14 +199,16 @@ Write-Step "2/7  Install binary"
 $exePath = Join-Path $InstallDir $ExeName
 
 if ($SkipInstall) {
-    Write-Skip "Skipped (--SkipInstall)"
+    Write-Skip "Skipped (-SkipInstall)"
     if (-not (Test-Path $exePath)) {
         $cmd = Get-Command mosaico -ErrorAction SilentlyContinue
         if (-not $cmd) {
             Fail "mosaico not found on PATH. Cannot skip install."
         }
-        $exePath = $cmd.Source
+        $exePath    = $cmd.Source
         $InstallDir = Split-Path $exePath -Parent
+        Write-Info "Using existing: $exePath"
+    } else {
         Write-Info "Using existing: $exePath"
     }
 } elseif ($FromSource) {
@@ -203,11 +228,7 @@ if ($SkipInstall) {
     Write-Info "Building (this may take a few minutes)..."
     Invoke-Or-Dry "cargo build --release" {
         Push-Location $SourceDir
-        try {
-            cargo build --release
-        } finally {
-            Pop-Location
-        }
+        try { cargo build --release } finally { Pop-Location }
     }
 
     $built = Join-Path $SourceDir "target\release\$ExeName"
@@ -215,12 +236,14 @@ if ($SkipInstall) {
         Fail "Build succeeded but $built not found"
     }
 
-    Invoke-Or-Dry "Install $built -> $exePath" {
+    if (-not $DryRun) {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         Copy-Item -Path $built -Destination $exePath -Force
         Unblock-File -Path $exePath
+        Write-Info "Installed from source to $exePath"
+    } else {
+        Write-Host "   ~ [dry-run] Install $built -> $exePath" -ForegroundColor Magenta
     }
-    Write-Info "Installed from source to $exePath"
 } else {
     # ── Download release ──
     $existingVersion = $null
@@ -230,7 +253,7 @@ if ($SkipInstall) {
         } catch { }
     }
 
-    if ($existingVersion -and -not $Force) {
+    if ($existingVersion -and -not $Force -and -not $Version) {
         Write-Info "Already installed: $existingVersion (use -Force to reinstall)"
     } else {
         # Stop daemon before replacing
@@ -238,16 +261,19 @@ if ($SkipInstall) {
         if ($running) {
             Write-Info "Stopping running daemon"
             Invoke-Or-Dry "Stop-Process" { $running | Stop-Process -Force }
-            Start-Sleep -Milliseconds 500
+            if (-not $DryRun) { Start-Sleep -Milliseconds 500 }
         }
 
-        Write-Info "Downloading latest release..."
+        Write-Info "Downloading release..."
         Invoke-Or-Dry "Download and extract release" {
             $headers = @{ "User-Agent" = "mosaico-setup" }
-            $release = Invoke-RestMethod `
-                -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-                -Headers $headers
-            $tag = $release.tag_name
+
+            $apiPath = "latest"
+            if ($Version) { $apiPath = "tags/$Version" }
+            $apiUri  = "https://api.github.com/repos/$Repo/releases/$apiPath"
+
+            $release = Invoke-RestMethod -Uri $apiUri -Headers $headers
+            $tag     = $release.tag_name
 
             $tempDir = Join-Path $env:TEMP "mosaico-setup-$PID"
             New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
@@ -255,7 +281,7 @@ if ($SkipInstall) {
             try {
                 $zip = Join-Path $tempDir "mosaico.zip"
                 $url = "https://github.com/$Repo/releases/download/$tag/mosaico-windows-amd64.zip"
-                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+                Invoke-WebRequestCompat -Uri $url -OutFile $zip
                 Expand-Archive -Path $zip -DestinationPath $tempDir -Force
 
                 $found = Get-ChildItem -Path $tempDir -Filter $ExeName -Recurse |
@@ -279,17 +305,22 @@ if ($SkipInstall) {
 # ─── Step 3: PATH ──────────────────────────────────────────────────────
 Write-Step "3/7  Update PATH"
 
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$InstallDir*") {
-    Invoke-Or-Dry "Add $InstallDir to user PATH" {
-        [Environment]::SetEnvironmentVariable(
-            "Path", "$userPath;$InstallDir", "User"
-        )
-    }
-    $env:Path = "$env:Path;$InstallDir"
-    Write-Info "Added to PATH"
-} else {
+if (Test-DirOnPath -Dir $InstallDir) {
     Write-Info "Already on PATH"
+} else {
+    Invoke-Or-Dry "Add $InstallDir to user PATH" {
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        $newPath  = if ([string]::IsNullOrWhiteSpace($userPath)) {
+            $InstallDir
+        } else {
+            "$userPath;$InstallDir"
+        }
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    }
+    if (-not $DryRun -and $env:Path -notlike "*$InstallDir*") {
+        $env:Path = "$env:Path;$InstallDir"
+    }
+    Write-Info "Added to PATH"
 }
 
 # ─── Step 4: Config ────────────────────────────────────────────────────
@@ -298,25 +329,36 @@ Write-Step "4/7  Generate config"
 if ($SkipConfig) {
     Write-Skip "Skipped (-SkipConfig)"
 } else {
-    $configFile = Join-Path $ConfigDir "config.toml"
+    $configFile   = Join-Path $ConfigDir "config.toml"
     $configExists = Test-Path $configFile
 
     if ($configExists -and -not $Force) {
         Write-Info "Config exists at $ConfigDir (use -Force to overwrite)"
     } else {
-        New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+        if ($configExists -and $Force) {
+            Write-Warn "Overwriting existing config at $ConfigDir"
+            Invoke-Or-Dry "Remove existing config" {
+                Remove-Item -Path (Join-Path $ConfigDir "*.toml") -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        Invoke-Or-Dry "Create $ConfigDir" {
+            New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+        }
 
         Invoke-Or-Dry "Run 'mosaico init'" {
             & $exePath init | Out-Null
         }
-        Write-Info "Wrote default config to $ConfigDir"
 
-        # Verify all expected files
-        $expected = @("config.toml", "keybindings.toml", "bar.toml", "user-rules.toml")
-        foreach ($f in $expected) {
-            $p = Join-Path $ConfigDir $f
-            if (Test-Path $p) {
-                Write-Host "     · $f" -ForegroundColor DarkGray
+        if (-not $DryRun) {
+            Write-Info "Wrote default config to $ConfigDir"
+
+            $expected = @("config.toml", "keybindings.toml", "bar.toml", "user-rules.toml")
+            foreach ($f in $expected) {
+                $p = Join-Path $ConfigDir $f
+                if (Test-Path $p) {
+                    Write-Host "     · $f" -ForegroundColor DarkGray
+                }
             }
         }
     }
@@ -328,7 +370,7 @@ Write-Step "5/7  PowerShell profile"
 if ($SkipProfile) {
     Write-Skip "Skipped (-SkipProfile)"
 } else {
-    # Write the profile extension to the config dir
+    # -------- 5a. Write the profile extension file --------
     Invoke-Or-Dry "Write $ProfileScript" {
         New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
@@ -337,10 +379,17 @@ if ($SkipProfile) {
 # Mosaico PowerShell Profile — auto-generated by setup.ps1
 # ──────────────────────────────────────────────────────────────────────
 
+# Guard against double-loading
+if ($global:MosaicoProfileLoaded) { return }
+$global:MosaicoProfileLoaded = $true
+
 $MosaicoExe = Join-Path $env:LOCALAPPDATA "mosaico\mosaico.exe"
 if (-not (Test-Path $MosaicoExe)) {
     $MosaicoCmd = Get-Command mosaico -ErrorAction SilentlyContinue
-    if (-not $MosaicoCmd) { return }
+    if (-not $MosaicoCmd) {
+        Write-Verbose "Mosaico not found; skipping profile setup."
+        return
+    }
 } else {
     $mosaicoDir = Split-Path $MosaicoExe -Parent
     if ($env:Path -notlike "*$mosaicoDir*") {
@@ -348,57 +397,60 @@ if (-not (Test-Path $MosaicoExe)) {
     }
 }
 
-# Tab completion for `mosaico`
-$MosaicoCompleter = {
-    param($wordToComplete, $commandAst, $cursorPosition)
-    $commands = @('start','stop','status','doctor','init','pause','unpause',
-        'restart','action','debug','autostart','config','--help','--version')
-    $actions  = @('focus','move','retile','toggle-monocle','cycle-layout',
-        'close-focused','minimize-focused',
-        'goto-workspace-1','goto-workspace-2','goto-workspace-3','goto-workspace-4',
-        'goto-workspace-5','goto-workspace-6','goto-workspace-7','goto-workspace-8',
-        'send-to-workspace-1','send-to-workspace-2','send-to-workspace-3','send-to-workspace-4',
-        'send-to-workspace-5','send-to-workspace-6','send-to-workspace-7','send-to-workspace-8')
-    $directions = @('left','right','up','down')
-    $debugSubs  = @('list','events')
-    $autostartSubs = @('enable','disable','status')
+# ─── Tab completion for `mosaico` ───
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $MosaicoCompleter = {
+        param($wordToComplete, $commandAst, $cursorPosition)
+        $commands = @('start','stop','status','doctor','init','pause','unpause',
+            'restart','action','debug','autostart','config','--help','--version')
+        $actions  = @('focus','move','retile','toggle-monocle','cycle-layout',
+            'close-focused','minimize-focused',
+            'goto-workspace-1','goto-workspace-2','goto-workspace-3','goto-workspace-4',
+            'goto-workspace-5','goto-workspace-6','goto-workspace-7','goto-workspace-8',
+            'send-to-workspace-1','send-to-workspace-2','send-to-workspace-3','send-to-workspace-4',
+            'send-to-workspace-5','send-to-workspace-6','send-to-workspace-7','send-to-workspace-8')
+        $directions    = @('left','right','up','down')
+        $debugSubs     = @('list','events')
+        $autostartSubs = @('enable','disable','status')
 
-    $tokens = $commandAst.CommandElements | ForEach-Object { $_.Value }
-    $prev = if ($tokens.Count -ge 2) { $tokens[$tokens.Count - 2] } else { $null }
+        $tokens = @($commandAst.CommandElements | ForEach-Object { $_.Value })
+        $prev   = if ($tokens.Count -ge 2) { $tokens[$tokens.Count - 2] } else { $null }
 
-    $candidates = switch ($prev) {
-        'action'    { $actions }
-        'debug'     { $debugSubs }
-        'autostart' { $autostartSubs }
-        'focus'     { $directions }
-        'move'      { $directions }
-        default {
-            if ($tokens.Count -le 2) { $commands } else { @() }
+        $candidates = switch ($prev) {
+            'action'    { $actions }
+            'debug'     { $debugSubs }
+            'autostart' { $autostartSubs }
+            'focus'     { $directions }
+            'move'      { $directions }
+            default {
+                if ($tokens.Count -le 2) { $commands } else { @() }
+            }
         }
+
+        $candidates | Where-Object { $_ -like "$wordToComplete*" } |
+            ForEach-Object {
+                [System.Management.Automation.CompletionResult]::new(
+                    $_, $_, 'ParameterValue', $_)
+            }
     }
-
-    $candidates | Where-Object { $_ -like "$wordToComplete*" } |
-        ForEach-Object {
-            [System.Management.Automation.CompletionResult]::new(
-                $_, $_, 'ParameterValue', $_)
-        }
+    Register-ArgumentCompleter -Native -CommandName mosaico -ScriptBlock $MosaicoCompleter
 }
-Register-ArgumentCompleter -Native -CommandName mosaico -ScriptBlock $MosaicoCompleter
 
-# Helper functions
+# ─── Helper functions ───
 function Start-Tiling    { mosaico start }
 function Stop-Tiling     { mosaico stop }
 function Restart-Tiling  { mosaico stop; Start-Sleep -Milliseconds 300; mosaico start }
 function Get-TilingStatus {
-    $proc = Get-Process -Name mosaico -ErrorAction SilentlyContinue
-    if ($proc) {
-        Write-Host "● Mosaico running (PID $($proc.Id))" -ForegroundColor Green
+    $proc = @(Get-Process -Name mosaico -ErrorAction SilentlyContinue)
+    if ($proc.Count -gt 0) {
+        Write-Host "● Mosaico running (PID $($proc[0].Id))" -ForegroundColor Green
     } else {
         Write-Host "○ Mosaico stopped" -ForegroundColor Red
     }
 }
-function Switch-TilingLayout { mosaico action cycle-layout }
+function Switch-TilingLayout  { mosaico action cycle-layout }
 function Invoke-TilingMonocle { mosaico action toggle-monocle }
+
 function Switch-Workspace {
     param([Parameter(Mandatory)][ValidateRange(1,8)][int]$Number)
     mosaico action "goto-workspace-$Number"
@@ -407,16 +459,19 @@ function Send-ToWorkspace {
     param([Parameter(Mandatory)][ValidateRange(1,8)][int]$Number)
     mosaico action "send-to-workspace-$Number"
 }
+
+function Get-MosaicoConfigDir {
+    if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME "mosaico" }
+    else { Join-Path $env:USERPROFILE ".config\mosaico" }
+}
 function Get-TilingConfig {
-    $dir = if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME "mosaico" }
-           else { Join-Path $env:USERPROFILE ".config\mosaico" }
+    $dir = Get-MosaicoConfigDir
     if (Test-Path $dir) { Invoke-Item $dir }
     else { Write-Warning "Config dir not found: $dir" }
 }
 function Edit-TilingConfig {
     param([ValidateSet('config','keybindings','bar','rules','user-rules')][string]$File='config')
-    $dir = if ($env:XDG_CONFIG_HOME) { Join-Path $env:XDG_CONFIG_HOME "mosaico" }
-           else { Join-Path $env:USERPROFILE ".config\mosaico" }
+    $dir  = Get-MosaicoConfigDir
     $path = Join-Path $dir "$File.toml"
     if (Test-Path $path) { Invoke-Item $path }
     else { Write-Warning "Not found: $path" }
@@ -424,6 +479,7 @@ function Edit-TilingConfig {
 function Get-TilingDoctor  { mosaico doctor }
 function Get-TilingWindows { mosaico debug list }
 
+# ─── Aliases ───
 Set-Alias ms        mosaico
 Set-Alias mtstart   Start-Tiling
 Set-Alias mtstop    Stop-Tiling
@@ -437,12 +493,15 @@ Set-Alias mtconfige Edit-TilingConfig
 Set-Alias mthealth  Get-TilingDoctor
 Set-Alias mtwindows Get-TilingWindows
 
-# Prompt indicator
-$MosaicoBasePrompt = $function:prompt
+# ─── Prompt indicator (safe re-entrancy) ───
+if (-not $global:MosaicoBasePrompt) {
+    $global:MosaicoBasePrompt = $function:prompt
+}
 function global:prompt {
     $proc = Get-Process -Name mosaico -ErrorAction SilentlyContinue
     $indicator = if ($proc) { "`e[36m◆`e[0m " } else { "`e[90m◇`e[0m " }
-    "$indicator" + (& $MosaicoBasePrompt)
+    $base = if ($global:MosaicoBasePrompt) { & $global:MosaicoBasePrompt } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
+    "$indicator$base"
 }
 '@
 
@@ -450,27 +509,30 @@ function global:prompt {
     }
     Write-Info "Wrote profile extension: $ProfileScript"
 
-    # Wire it into $PROFILE
-    $sourceLine = ". `"$ProfileScript`""
+    # -------- 5b. Wire it into $PROFILE --------
+    $sourceLine  = ". `"$ProfileScript`""
     $profilePath = $PROFILE.CurrentUserAllHosts
+    $marker      = "# Mosaico tiling window manager helpers"
 
-    $profileExists = Test-Path $profilePath
-    if (-not $profileExists) {
+    if (-not (Test-Path $profilePath)) {
         Invoke-Or-Dry "Create $profilePath" {
             New-Item -ItemType File -Path $profilePath -Force | Out-Null
         }
     }
 
-    $profileContent = if ($profileExists) {
-        Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
-    } else { "" }
+    $alreadyWired = $false
+    if (-not $DryRun -and (Test-Path $profilePath)) {
+        $profileContent = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
+        if ($profileContent -and ($profileContent -like "*$ProfileScript*")) {
+            $alreadyWired = $true
+        }
+    }
 
-    if ($profileContent -and $profileContent.Contains($sourceLine)) {
+    if ($alreadyWired) {
         Write-Info "Already sourced from `$PROFILE"
     } else {
         Invoke-Or-Dry "Add source line to `$PROFILE" {
-            $comment = "# Mosaico tiling window manager helpers"
-            Add-Content -Path $profilePath -Value "`n$comment`n$sourceLine"
+            Add-Content -Path $profilePath -Value "`r`n$marker`r`n$sourceLine"
         }
         Write-Info "Added source line to $profilePath"
     }
@@ -495,28 +557,34 @@ Write-Step "7/7  Verify"
 if ($DryRun) {
     Write-Host "   ~ [dry-run] Would run: mosaico doctor" -ForegroundColor Magenta
 } else {
-    $version = & $exePath --version 2>$null
-    Write-Info "Binary: $version"
-
-    $files = @("config.toml","keybindings.toml","bar.toml","user-rules.toml")
-    $missing = $files | Where-Object { -not (Test-Path (Join-Path $ConfigDir $_)) }
-    if ($missing.Count -eq 0 -and -not $SkipConfig) {
-        Write-Info "Config: all 4 files present"
-    } elseif (-not $SkipConfig) {
-        Write-Warn "Missing config files: $($missing -join ', ')"
+    try {
+        $version = & $exePath --version 2>$null
+        Write-Info "Binary: $version"
+    } catch {
+        Write-Warn "Could not query binary version"
     }
 
-    if (-not $SkipProfile) {
+    $files   = @("config.toml","keybindings.toml","bar.toml","user-rules.toml")
+    $missing = @($files | Where-Object { -not (Test-Path (Join-Path $ConfigDir $_)) })
+    if (-not $SkipConfig) {
+        if ($missing.Count -eq 0) {
+            Write-Info "Config: all 4 files present"
+        } else {
+            Write-Warn "Missing config files: $($missing -join ', ')"
+        }
+    }
+
+    if (-not $SkipProfile -and (Test-Path $PROFILE.CurrentUserAllHosts)) {
         $wired = (Get-Content $PROFILE.CurrentUserAllHosts -Raw -ErrorAction SilentlyContinue) `
             -like "*$ProfileScript*"
         if ($wired) { Write-Info "Profile: wired into `$PROFILE" }
-        else { Write-Warn "Profile: source line not found in `$PROFILE" }
+        else        { Write-Warn "Profile: source line not found in `$PROFILE" }
     }
 
     if (-not $SkipAutostart) {
         try {
             $auto = & $exePath autostart status 2>$null
-            Write-Info "Autostart: $auto"
+            if ($auto) { Write-Info "Autostart: $auto" }
         } catch { }
     }
 }
@@ -534,7 +602,7 @@ Write-Host "  ║                 Setup complete                   ║" -Foregro
 Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 
-Write-Host "  Binary:   $exePath" -ForegroundColor Gray
+Write-Host "  Binary:   $exePath"  -ForegroundColor Gray
 Write-Host "  Config:   $ConfigDir" -ForegroundColor Gray
 if (-not $SkipProfile) {
     Write-Host "  Profile:  $ProfileScript" -ForegroundColor Gray
